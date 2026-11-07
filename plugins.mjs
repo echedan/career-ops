@@ -44,7 +44,12 @@ const DATA_ROOT = getCareerOpsRoot();
 // The same read resolution as set-status.mjs and every other tracker reader:
 // CAREER_OPS_TRACKER, then data/applications.md, then the legacy root copy.
 const APPLICATIONS_PATH = resolveTrackerPath(DATA_ROOT);
-const PIPELINE_PATH = path.join(DATA_ROOT, 'data', 'pipeline.md');
+// The same resolution as scan.mjs's PIPELINE_PATH, so the CAREER_OPS_PIPELINE
+// lane is honored by the de-dup read, the export snapshot, the write and the
+// log line alike (#6353). Passed to appendToPipeline() explicitly rather than
+// left to its default, so all four always agree on one file.
+const PIPELINE_PATH = process.env.CAREER_OPS_PIPELINE || path.join(DATA_ROOT, 'data', 'pipeline.md');
+const PIPELINE_LABEL = process.env.CAREER_OPS_PIPELINE ? PIPELINE_PATH : 'data/pipeline.md';
 
 // A misbehaving plugin's stray rejection should be attributed and not silently
 // crash the host (the engine's per-hook try/catch handles the common case; this
@@ -104,7 +109,7 @@ function trackerSnapshotRows(md) {
   return rows;
 }
 
-/** URLs already present in data/pipeline.md, for additive de-duplication. */
+/** URLs already present in the pipeline (data/pipeline.md or the CAREER_OPS_PIPELINE lane), for additive de-duplication. */
 function existingPipelineUrls() {
   const urls = new Set();
   if (!existsSync(PIPELINE_PATH)) return urls;
@@ -180,6 +185,11 @@ function buildSnapshot() {
 }
 
 async function cmdList() {
+  const problem = readPluginConfigListError(DATA_ROOT);
+  if (problem) {
+    console.error(problem);
+    process.exit(1);
+  }
   warnConfigLeftInCodeRoot(ROOT, DATA_ROOT);
   const cfg = await loadPluginConfig(DATA_ROOT);
   await loadDotenvOnce(DATA_ROOT);
@@ -208,6 +218,11 @@ async function cmdList() {
 }
 
 async function cmdRun(args) {
+  const problem = readPluginConfigListError(DATA_ROOT);
+  if (problem) {
+    console.error(problem);
+    process.exit(1);
+  }
   const dryRun = args.includes('--dry-run');
   const positional = args.filter(a => a !== '--dry-run');
   const token = positional[0];
@@ -262,12 +277,12 @@ async function cmdRun(args) {
     console.log(`${id} ${hook}: ${found.length} found, ${jobs.length} new${skipped ? ` (skipped: ${skipped})` : ''}.`);
     if (dryRun) { jobs.slice(0, 20).forEach(j => console.log(`  • ${j.title} — ${j.url}`)); console.log('(--dry-run: pipeline not written)'); return; }
     if (jobs.length) {
-      await appendToPipeline(jobs);
+      await appendToPipeline(jobs, { pipelinePath: PIPELINE_PATH });
       // Recorded so the next ingest, and every scanner, sees these as known.
       // Only postings: an interview event in scan-history would read as a
       // scanned job everywhere scan-history is counted.
       if (manifest.jobPostings) await appendToScanHistory(jobs, localToday(), 'added');
-      console.log(`→ Appended ${jobs.length} to data/pipeline.md. Run /career-ops pipeline to evaluate.`);
+      console.log(`→ Appended ${jobs.length} to ${PIPELINE_LABEL}. Run /career-ops pipeline to evaluate.`);
     }
     return;
   }
@@ -369,6 +384,41 @@ export function parsePluginConfig(raw, file) {
     throw new Error(`${file} does not contain a YAML mapping — refusing to overwrite it. Nothing was changed.`);
   }
   return cfg;
+}
+
+/**
+ * Why `list` and `run` stop. Scan keeps loadPluginConfig's fail-open read.
+ * Null when the file is absent, empty, or a YAML mapping.
+ * @param {string|null} raw
+ * @param {string} [file]
+ * @returns {string|null}
+ */
+export function pluginConfigListError(raw, file = 'config/plugins.yml') {
+  if (raw == null) return null;
+  try {
+    parsePluginConfig(raw, file);
+    return null;
+  } catch (err) {
+    const first = String(err.message).split('\n')[0];
+    const yaml = first.match(/valid YAML \((.*)\) —/);
+    const detail = yaml ? yaml[1] : (first.includes('YAML mapping') ? 'the file is not a YAML mapping' : first);
+    return `${file}: ${detail}. A broken file is not the same as every plugin being off. Fix ${file}, then run: node plugins.mjs list`;
+  }
+}
+
+function readPluginConfigListError(root) {
+  const rel = 'config/plugins.yml';
+  const file = path.join(root, rel);
+  // Read first and treat only ENOENT as absent. existsSync says false for a
+  // file in a config/ this user cannot search, which would list every plugin as off.
+  let raw;
+  try {
+    raw = readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') return null;
+    return `${rel} could not be read (${err.message}). Fix the file, then run: node plugins.mjs list`;
+  }
+  return pluginConfigListError(raw, rel);
 }
 
 // Write enabled:true/false into config/plugins.yml, merging (never clobbering
@@ -641,7 +691,7 @@ async function main() {
 
 // Named exports for the test suite — not part of the CLI API.
 export const _testPaths = Object.freeze({ APPLICATIONS_PATH, PIPELINE_PATH });
-export { buildSnapshot as _testBuildSnapshot };
+export { buildSnapshot as _testBuildSnapshot, existingPipelineUrls as _testExistingPipelineUrls };
 
 if (isMainModule(import.meta.url)) {
   main().catch(err => { console.error('Fatal:', err.message); process.exit(1); });
